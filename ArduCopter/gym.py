@@ -11,7 +11,7 @@ class ArduPilotSITLEnv(gym.Env):
     """
     Gymnasium Environment for ArduPilot SITL simulator to optimize copter parameters using RL.
     
-    This environment allows reinforcement learning algorithms to find optimal parameter sets
+    This environment should allow reinforcement learning algorithms to find optimal parameter sets
     for ArduPilot-based copters by interacting with the SITL simulator.
     """
     
@@ -31,13 +31,12 @@ class ArduPilotSITLEnv(gym.Env):
             vehicle: ArduPilot vehicle type (e.g., "copter", "plane")
             param_ranges: Dictionary mapping parameter names to their min/max value ranges
             mission_file: Path to a mission file to load for evaluation
-            sitl_port: SITL connection port
+            sitl_port: SITL connection port : default 5760, but if having multiple environments have a way to dynamically select it
             max_episode_steps: Maximum steps per episode
             reward_weights: Dictionary with weights for different components of the reward function
         """
         super(ArduPilotSITLEnv, self).__init__()
         
-        # Store configuration
         self.frame_type = frame_type
         self.vehicle = vehicle
         self.sitl_port = sitl_port
@@ -48,7 +47,7 @@ class ArduPilotSITLEnv(gym.Env):
         self.steps = 0
         self.mavlink_port = self.sitl_port + 2
         
-        # Default parameter ranges if none specified
+        #default parameter ranges if none specified
         self.param_ranges = param_ranges or {
             "PSC_POSXY_P": (0.5, 2.0),
             "PSC_VELXY_P": (0.5, 2.0),
@@ -91,7 +90,7 @@ class ArduPilotSITLEnv(gym.Env):
             dtype=np.float32
         )
         
-        # Track best parameters and performance
+        # to track best parameters and performance
         self.best_reward = -np.inf
         self.best_params = {}
         
@@ -114,7 +113,7 @@ class ArduPilotSITLEnv(gym.Env):
             "--console",
             # "--home 15.3911, 73.8781,0,0",
             # "--custom-location=15.3911,73.8781,0,0", # bits goa map
-            "--custom-location=0,0,0,0", # bits goa map
+            "--custom-location=0,0,0,0",
             "--map",
             "-I0",
             "--no-extra-ports"
@@ -156,6 +155,7 @@ class ArduPilotSITLEnv(gym.Env):
     
     def load_mission(self):
         """Load a mission from file."""
+        # This should ideally load a mission file from some txt file or something but for now manually setting the waypoints
         self.mission_waypoints = [
             {"lat": 0.0, "lon": 0.0, "alt": 10.0},
             {"lat": 0.0001, "lon": 0.0, "alt": 15.0},
@@ -282,8 +282,14 @@ class ArduPilotSITLEnv(gym.Env):
         
         return telemetry
     
+    def get_parameters(self, param_name):
+        """Get parameter value from the vehicle."""
+        # This is a stub that should be implemented to retrieve actual parameter values 
+        # from the MAVLink connection for now just returning
+        #  a default value
+        return 0.5
+    
     def flatten_observation(self, telemetry, normalized_params):
-        """Convert telemetry and parameters to a flat observation array."""
         obs = [
             telemetry["position"]["x"],
             telemetry["position"]["y"],
@@ -303,8 +309,11 @@ class ArduPilotSITLEnv(gym.Env):
         ]
         
         # Add normalized parameters
-        for param_name in self.param_keys:
-            obs.append(normalized_params[param_name])
+        # for param_name in self.param_keys:
+            
+        
+        # return np.array(obs, dtype=np.float32)
+        #    obs.append(normalized_params[param_name])
         
         return np.array(obs, dtype=np.float32)
     
@@ -316,7 +325,7 @@ class ArduPilotSITLEnv(gym.Env):
         target = self.mission_waypoints[self.current_waypoint_idx]
         
         # Simple Euclidean distance for now
-        # In a real implementation, you'd use proper coordinate conversions
+        # In a real implementation, have to use and do coordinate conversions
         error = math.sqrt(
             (telemetry["position"]["x"] - target["lat"] * 1e5) ** 2 +
             (telemetry["position"]["y"] - target["lon"] * 1e5) ** 2 +
@@ -411,6 +420,34 @@ class ArduPilotSITLEnv(gym.Env):
             if self.current_waypoint_idx >= len(self.mission_waypoints):
                 self.mission_completed = True
     
+    def wait_for_position(self):
+        """Wait for the vehicle to get a valid position."""
+        print("Waiting for valid GPS position...")
+        max_wait_time = 30  # Maximum time to wait in seconds
+        start_time = time.time()
+        
+        while time.time() - start_time < max_wait_time:
+            # Check for GPS_RAW_INT which has the fix_type field
+            gps_msg = self.mavlink_connection.recv_match(type='GPS_RAW_INT', blocking=False)
+            if gps_msg and gps_msg.fix_type >= 3:  # 3D fix or better
+                print(f"Valid GPS fix received (fix_type: {gps_msg.fix_type})")
+                return True
+                
+            # Also check position messages as a backup
+            pos_msg = self.mavlink_connection.recv_match(type=['GLOBAL_POSITION_INT', 'LOCAL_POSITION_NED'], blocking=True, timeout=1)
+            if pos_msg and (pos_msg.get_type() == 'GLOBAL_POSITION_INT' or pos_msg.get_type() == 'LOCAL_POSITION_NED'):
+                if pos_msg.get_type() == 'GLOBAL_POSITION_INT' and pos_msg.lat != 0 and pos_msg.lon != 0:
+                    print("Valid global position received")
+                    return True
+                elif pos_msg.get_type() == 'LOCAL_POSITION_NED' and (pos_msg.x != 0 or pos_msg.y != 0):
+                    print("Valid local position received")
+                    return True
+            time.sleep(0.1)
+        
+        print("Failed to get valid position within timeout")
+        return False
+        
+        
     def reset(self, **kwargs):
         """Reset the environment to initial state."""
         # If SITL is running, stop it
@@ -432,31 +469,32 @@ class ArduPilotSITLEnv(gym.Env):
         normalized_params = self.get_normalized_parameters()
         observation = self.flatten_observation(telemetry, normalized_params)
         
-        return observation, {}
-    
-    def step(self, action):
-        """
-        Take a step in the environment.
-        
-        Args:
-            action: Normalized parameter values [0,1] for each parameter
-            
-        Returns:
-            observation, reward, terminated, truncated, info
-        """
-        self.steps += 1
-        
-        # Convert actions to parameter values and set them
-        params_dict = self.convert_actions_to_parameters(action)
-        self.set_parameters(params_dict)
-        
-        # Wait for parameters to take effect
-        time.sleep(0.5)
-        
+        # return observation, {}
         # If not already armed and in guided mode, do so
         if not self.mission_started:
+            # Wait for GPS position to be valid
+            self.wait_for_position()
+            
             # Send arm command
             self.mavlink_connection.arducopter_arm()
+            time.sleep(1)
+            
+            # First set mode to GUIDED to ensure position is being used
+            self.mavlink_connection.set_mode("GUIDED")
+            time.sleep(2)
+            
+            # Then set mode to AUTO for mission execution
+            self.mavlink_connection.set_mode_auto()
+            time.sleep(3)
+            
+            # Start mission
+            self.mavlink_connection.mav.mission_set_current_send(
+                self.mavlink_connection.target_system,
+                self.mavlink_connection.target_component,
+                0
+            )
+            self.mission_started = True
+            time.sleep(1)
             time.sleep(1)
             
             # Set mode to GUIDED
@@ -475,6 +513,24 @@ class ArduPilotSITLEnv(gym.Env):
             #     mavutil.mavlink.MAV_MODE_GUIDED
             # )
             # self.mavlink_connection.waypoint_current_send(0)
+
+            # requires some specific fixing at `mavutils.py`
+               # set mode by integer mode number for ArduPilot
+                    # # self.mav.command_long_send(self.target_system,
+                    # #                            self.target_component,
+                    # #                            mavlink.MAV_CMD_DO_SET_MODE,
+                    # #                            0,
+                    # #                            mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+                    # #                            mode,
+                    # #                            0,
+                    # #                            0,
+                    # #                            0,
+                    # #                            0,
+                    # #                            0)
+                    # self.mav.set_mode_send(self.target_system, mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED, mode)
+            # this has to be modified because on newer python versions the older mavutils is giving issues
+
+
             self.mission_started = True
             time.sleep(1)
         
@@ -486,6 +542,9 @@ class ArduPilotSITLEnv(gym.Env):
         
         # Calculate reward
         reward = self.calculate_reward(telemetry)
+        
+        # Get current parameters
+        params_dict = {param_name: self.get_parameters(param_name) for param_name in self.param_keys}
         
         # Check if current parameters are better than best known
         if reward > self.best_reward:
@@ -537,7 +596,7 @@ class ArduPilotSITLEnv(gym.Env):
             self.sitl_process = None
 
 
-# Example usage
+#Sample Example usage
 if __name__ == "__main__":
     # Create the environment
     env = ArduPilotSITLEnv(
